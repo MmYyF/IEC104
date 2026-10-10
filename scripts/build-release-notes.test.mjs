@@ -55,7 +55,7 @@ describe('buildBody', () => {
   })
   it('places the CN mirror banner above the download table', () => {
     const body = buildBody('v1.2.3', md)
-    const bannerIdx = body.indexOf('ghfast.top/https://github.com/Karl-Dai/IEC60870-5-104-Simulator/releases/latest')
+    const bannerIdx = body.indexOf('ghfast.top/https://github.com/MmYyF/IEC104/releases/latest')
     const tableIdx = body.indexOf('## 下载 / Downloads')
     expect(bannerIdx).toBeGreaterThanOrEqual(0)
     expect(tableIdx).toBeGreaterThanOrEqual(0)

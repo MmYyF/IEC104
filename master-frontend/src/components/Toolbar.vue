@@ -30,7 +30,7 @@ const resetWorkspaceView = inject<() => void>('resetWorkspaceView')!
 type UpdateMeta = { version: string; notes: string; pub_date?: string | null }
 const checkUpdate = inject<(force?: boolean) => Promise<UpdateMeta | null>>('checkUpdate')!
 const updateChecking = ref(false)
-const MIRROR_RELEASE_URL = 'https://ghfast.top/https://github.com/Karl-Dai/IEC60870-5-104-Simulator/releases/latest'
+const MIRROR_RELEASE_URL = 'https://ghfast.top/https://github.com/MmYyF/IEC104/releases/latest'
 
 async function manualCheckUpdate() {
   if (updateChecking.value) return

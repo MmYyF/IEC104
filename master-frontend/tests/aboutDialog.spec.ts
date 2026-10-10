@@ -13,7 +13,7 @@ vi.mock('@tauri-apps/api/app', () => ({
   getVersion: () => Promise.resolve('1.15.7'),
 }))
 
-const REPO = 'https://github.com/Karl-Dai/IEC60870-5-104-Simulator'
+const REPO = 'https://github.com/MmYyF/IEC104'
 const SIMLAB = 'https://simlab.carldai.cloud'
 
 describe('AboutDialog localization', () => {

@@ -4,7 +4,7 @@
 # 退出码:0 = 至少一个 proxy 同时通过 manifest+bundle 透传;1 = 基线失败或无可用 proxy。
 set -u
 
-REPO="Karl-Dai/IEC60870-5-104-Simulator"
+REPO="MmYyF/IEC104"
 MANIFEST_PATH="releases/latest/download/latest-master.json"
 ORIGIN="https://github.com/$REPO/$MANIFEST_PATH"
 
