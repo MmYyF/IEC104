@@ -138,6 +138,9 @@ export interface RemoteOperationConfig {
   sbo_timeout_ms: number
   answer_clock_sync: boolean
   send_act_term: boolean
+  cot_len: number
+  ca_len: number
+  ioa_len: number
 }
 
 /** 周期变位方式:翻转(两态振荡)/递增/递减(三角波)/范围内随机。 */
@@ -197,4 +200,7 @@ export const DEFAULT_REMOTE_OPS: RemoteOperationConfig = {
   sbo_timeout_ms: 30000,
   answer_clock_sync: true,
   send_act_term: true,
+  cot_len: 2,
+  ca_len: 2,
+  ioa_len: 3,
 }

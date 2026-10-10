@@ -364,7 +364,22 @@ fn decode_element(
 /// Always returns a `ParsedFrame`; soft errors (length mismatch, unknown
 /// ASDU type, truncated objects) are accumulated in `warnings` rather than
 /// short-circuiting, so the UI can still show whatever was decoded.
+/// Parse a complete IEC 104 APDU (APCI + optional ASDU + objects).
+///
+/// Always returns a `ParsedFrame`; soft errors (length mismatch, unknown
+/// ASDU type, truncated objects) are accumulated in `warnings` rather than
+/// short-circuiting, so the UI can still show whatever was decoded.
 pub fn parse_frame_full(data: &[u8]) -> Result<ParsedFrame, String> {
+    parse_frame_full_with_lengths(data, 2, 2, 3)
+}
+
+/// Parse an IEC 104 APDU with configurable COT, CA, and IOA byte lengths.
+pub fn parse_frame_full_with_lengths(
+    data: &[u8],
+    cot_len: usize,
+    ca_len: usize,
+    ioa_len: usize,
+) -> Result<ParsedFrame, String> {
     if data.len() < 6 {
         return Err(format!("frame too short: {} bytes, need ≥ 6", data.len()));
     }
@@ -392,7 +407,7 @@ pub fn parse_frame_full(data: &[u8]) -> Result<ParsedFrame, String> {
     };
 
     let asdu = if matches!(apci, ParsedApci::I { .. }) {
-        Some(parse_asdu(data, &mut warnings))
+        Some(parse_asdu_with_lengths(data, cot_len, ca_len, ioa_len, &mut warnings))
     } else {
         None
     };
@@ -459,10 +474,21 @@ fn format_quality(q: &QualityFlags) -> String {
 }
 
 /// Parse the ASDU portion of an I-frame, starting at byte 6.
+#[allow(dead_code)]
 fn parse_asdu(data: &[u8], warnings: &mut Vec<String>) -> ParsedAsdu {
-    // ASDU header is 6 bytes: type / VSQ / COT / OA / CA(2)
-    if data.len() < 12 {
-        warnings.push(format!("ASDU header truncated: only {} bytes after APCI", data.len() - 6));
+    parse_asdu_with_lengths(data, 2, 2, 3, warnings)
+}
+
+fn parse_asdu_with_lengths(
+    data: &[u8],
+    cot_len: usize,
+    ca_len: usize,
+    ioa_len: usize,
+    warnings: &mut Vec<String>,
+) -> ParsedAsdu {
+    let header_len = 2 + cot_len + ca_len;
+    if data.len() < 6 + header_len {
+        warnings.push(format!("ASDU header truncated: only {} bytes after APCI", data.len().saturating_sub(6)));
         return ParsedAsdu {
             type_id: data.get(6).copied().unwrap_or(0),
             type_name: String::from("(truncated)"),
@@ -482,8 +508,12 @@ fn parse_asdu(data: &[u8], warnings: &mut Vec<String>) -> ParsedAsdu {
     let cot = cause_byte & 0x3F;
     let negative = cause_byte & 0x40 != 0;
     let test = cause_byte & 0x80 != 0;
-    let originator = data[9];
-    let common_address = u16::from_le_bytes([data[10], data[11]]);
+    let originator = if cot_len >= 2 { data[9] } else { 0 };
+    let ca_offset = 8 + cot_len;
+    let common_address = match ca_len {
+        1 => data[ca_offset] as u16,
+        _ => u16::from_le_bytes([data[ca_offset], data[ca_offset + 1]]),
+    };
 
     let type_name = AsduTypeId::from_u8(type_id)
         .map(|t| t.name().to_string())
@@ -492,7 +522,8 @@ fn parse_asdu(data: &[u8], warnings: &mut Vec<String>) -> ParsedAsdu {
         .map(|c| c.name().to_string())
         .unwrap_or_else(|| format!("COT{}", cot));
 
-    let objects = decode_objects(type_id, sq, num_objects as usize, &data[12..], warnings);
+    let obj_offset = 6 + header_len;
+    let objects = decode_objects_with_lengths(type_id, sq, num_objects as usize, &data[obj_offset..], ioa_len, warnings);
 
     ParsedAsdu {
         type_id, type_name,
@@ -504,11 +535,23 @@ fn parse_asdu(data: &[u8], warnings: &mut Vec<String>) -> ParsedAsdu {
     }
 }
 
+#[allow(dead_code)]
 fn decode_objects(
     type_id: u8,
     sq: bool,
     num: usize,
     body: &[u8],
+    warnings: &mut Vec<String>,
+) -> Vec<ParsedObject> {
+    decode_objects_with_lengths(type_id, sq, num, body, 3, warnings)
+}
+
+fn decode_objects_with_lengths(
+    type_id: u8,
+    sq: bool,
+    num: usize,
+    body: &[u8],
+    ioa_len: usize,
     warnings: &mut Vec<String>,
 ) -> Vec<ParsedObject> {
     let elem_layout = match asdu_element_size(type_id) {
@@ -527,12 +570,16 @@ fn decode_objects(
     for i in 0..num {
         let need_ioa = !sq || i == 0;
         if need_ioa {
-            if offset + 3 > body.len() {
+            if offset + ioa_len > body.len() {
                 warnings.push(format!("truncated at object #{}: missing IOA", i));
                 break;
             }
-            base_ioa = u32::from_le_bytes([body[offset], body[offset + 1], body[offset + 2], 0]);
-            offset += 3;
+            base_ioa = match ioa_len {
+                1 => body[offset] as u32,
+                2 => u16::from_le_bytes([body[offset], body[offset + 1]]) as u32,
+                _ => u32::from_le_bytes([body[offset], body[offset + 1], body[offset + 2], 0]),
+            };
+            offset += ioa_len;
         }
         let ioa = if sq { base_ioa + i as u32 } else { base_ioa };
 

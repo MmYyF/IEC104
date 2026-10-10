@@ -577,6 +577,14 @@ export type DictShape = {
     dpIndeterminate: string
   }
   remoteParams: {
+    dataLengths: string
+    dataLengthsSub: string
+    cotLen: string
+    cotLenHint: string
+    caLen: string
+    caLenHint: string
+    ioaLen: string
+    ioaLenHint: string
     linkParams: string
     linkParamsSub: string
     hintT0: string
@@ -1246,6 +1254,14 @@ const dict: DictShape = {
     dpIndeterminate: '不确定',
   },
   remoteParams: {
+    dataLengths: '数据长度',
+    dataLengthsSub: '配置传送原因、ASDU公共地址与信息体地址的字节长度',
+    cotLen: '传送原因长度 (COT)',
+    cotLenHint: '可选 1 或 2 字节（标准默认 2 字节）',
+    caLen: '公共地址长度 (CA)',
+    caLenHint: '可选 1 或 2 字节（标准默认 2 字节）',
+    ioaLen: '信息体地址长度 (IOA)',
+    ioaLenHint: '可选 1、2 或 3 字节（标准默认 3 字节）',
     linkParams: '链路参数',
     linkParamsSub: '协议时序与窗口',
     hintT0: '建立连接超时',

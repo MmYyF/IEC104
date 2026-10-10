@@ -334,6 +334,12 @@ pub struct RemoteOperationConfig {
     /// 命令执行后在 ACT_CON(7) 之外追加终止帧(COT 取 execute_ack_cot,默认 10)。
     /// 关闭后仅回 ACT_CON,适配不期待 ACT_TERM 的主站(issue #28 Actterm 开关)。
     pub send_act_term: bool,
+    /// 传送原因长度 (COT): 1 或 2 字节, 默认 2
+    pub cot_len: u8,
+    /// ASDU 公共地址长度 (CA): 1 或 2 字节, 默认 2
+    pub ca_len: u8,
+    /// 信息体地址长度 (IOA): 1, 2 或 3 字节, 默认 3
+    pub ioa_len: u8,
 }
 
 impl Default for RemoteOperationConfig {
@@ -358,6 +364,9 @@ impl Default for RemoteOperationConfig {
             sbo_timeout_ms: 30_000,
             answer_clock_sync: true,
             send_act_term: true,
+            cot_len: 2,
+            ca_len: 2,
+            ioa_len: 3,
         }
     }
 }
@@ -373,6 +382,31 @@ impl RemoteOperationConfig {
         Self {
             auto_map_commands: false,
             ..Self::default()
+        }
+    }
+
+    #[inline]
+    pub fn normalized_cot_len(&self) -> usize {
+        match self.cot_len {
+            1 => 1,
+            _ => 2,
+        }
+    }
+
+    #[inline]
+    pub fn normalized_ca_len(&self) -> usize {
+        match self.ca_len {
+            1 => 1,
+            _ => 2,
+        }
+    }
+
+    #[inline]
+    pub fn normalized_ioa_len(&self) -> usize {
+        match self.ioa_len {
+            1 => 1,
+            2 => 2,
+            _ => 3,
         }
     }
 }
@@ -877,14 +911,26 @@ impl ClockSyncDecision {
 ///
 /// 校验顺序与命令语义一致：先排除无法解析的结构，再判 COT；只有合法
 /// 激活(COT=6)才校验系统命令固定 IOA=0，最后才应用应答开关。
+#[allow(dead_code)]
 fn decide_clock_sync(frame: &[u8], enabled: bool) -> ClockSyncDecision {
+    decide_clock_sync_with_lengths(frame, enabled, 2, 2, 3)
+}
+
+fn decide_clock_sync_with_lengths(
+    frame: &[u8],
+    enabled: bool,
+    cot_len: usize,
+    ca_len: usize,
+    ioa_len: usize,
+) -> ClockSyncDecision {
     if frame.len() < 2
         || frame.first() != Some(&0x68)
         || frame[1] as usize + 2 != frame.len()
     {
         return ClockSyncDecision::Malformed { reason: "apdu_length" };
     }
-    if frame.len() != 22 {
+    let expected_len = 6 + 2 + cot_len + ca_len + ioa_len + 7;
+    if frame.len() != expected_len {
         return ClockSyncDecision::Malformed { reason: "cp56_length" };
     }
     if frame[6] != 103 {
@@ -900,7 +946,12 @@ fn decide_clock_sync(frame: &[u8], enabled: bool) -> ClockSyncDecision {
         return ClockSyncDecision::UnknownCot { cot };
     }
 
-    let ioa = u32::from_le_bytes([frame[12], frame[13], frame[14], 0]);
+    let ioa_offset = 8 + cot_len + ca_len;
+    let ioa = match ioa_len {
+        1 => frame[ioa_offset] as u32,
+        2 => u16::from_le_bytes([frame[ioa_offset], frame[ioa_offset + 1]]) as u32,
+        _ => u32::from_le_bytes([frame[ioa_offset], frame[ioa_offset + 1], frame[ioa_offset + 2], 0]),
+    };
     if ioa != 0 {
         return ClockSyncDecision::UnknownIoa { ioa };
     }
@@ -966,7 +1017,7 @@ fn clock_sync_log_entry(decision: ClockSyncDecision, ca: u16, frame_len: usize) 
 // ---------------------------------------------------------------------------
 
 /// 控制命令携带的值(按命令族)。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum CommandValue {
     Single(bool),
     Double(u8),
@@ -1007,50 +1058,70 @@ struct ParsedControlCommand {
 
 /// 解析 45-51 / 58-64 控制命令帧;长度不足或类型非控制方向返回 None。
 /// 帧布局:6 APCI + type(1) vsq(1) cot(2) ca(2) + ioa(3) + 值/限定词 [+ CP56Time2a(7)]。
+#[allow(dead_code)]
 fn parse_control_command(asdu_type: u8, data: &[u8]) -> Option<ParsedControlCommand> {
+    parse_control_command_with_lengths(asdu_type, data, 2, 2, 3)
+}
+
+fn parse_control_command_with_lengths(
+    asdu_type: u8,
+    data: &[u8],
+    cot_len: usize,
+    ca_len: usize,
+    ioa_len: usize,
+) -> Option<ParsedControlCommand> {
     let type_id = AsduTypeId::from_u8(asdu_type)?;
     if !type_id.is_control() { return None; }
     let time_len = if type_id.is_timestamped() { 7usize } else { 0 };
     let base = type_id.untimestamped_variant();
-    let min_len = match base {
-        AsduTypeId::CScNa1 | AsduTypeId::CDcNa1 | AsduTypeId::CRcNa1 => 16 + time_len,
-        AsduTypeId::CSeNa1 | AsduTypeId::CSeNb1 => 18 + time_len,
-        AsduTypeId::CSeNc1 => 20 + time_len,
-        AsduTypeId::CBoNa1 => 19 + time_len,
+    let val_size = match base {
+        AsduTypeId::CScNa1 | AsduTypeId::CDcNa1 | AsduTypeId::CRcNa1 => 1,
+        AsduTypeId::CSeNa1 | AsduTypeId::CSeNb1 => 3,
+        AsduTypeId::CSeNc1 => 5,
+        AsduTypeId::CBoNa1 => 4,
         _ => return None,
     };
+    let asdu_hdr_len = 2 + cot_len + ca_len;
+    let ioa_offset = 6 + asdu_hdr_len;
+    let val_offset = ioa_offset + ioa_len;
+    let min_len = val_offset + val_size + time_len;
     if data.len() < min_len { return None; }
-    let ioa = u32::from_le_bytes([data[12], data[13], data[14], 0]);
+
+    let ioa = match ioa_len {
+        1 => data[ioa_offset] as u32,
+        2 => u16::from_le_bytes([data[ioa_offset], data[ioa_offset + 1]]) as u32,
+        _ => u32::from_le_bytes([data[ioa_offset], data[ioa_offset + 1], data[ioa_offset + 2], 0]),
+    };
     let (value, is_select, qu, frame_label) = match base {
         AsduTypeId::CScNa1 => {
-            let sco = data[15];
+            let sco = data[val_offset];
             (CommandValue::Single(sco & 0x01 != 0), sco & 0x80 != 0, (sco >> 2) & 0x1F, FrameLabel::SingleCommand)
         }
         AsduTypeId::CDcNa1 => {
-            let dco = data[15];
+            let dco = data[val_offset];
             (CommandValue::Double(dco & 0x03), dco & 0x80 != 0, (dco >> 2) & 0x1F, FrameLabel::DoubleCommand)
         }
         AsduTypeId::CRcNa1 => {
-            let rco = data[15];
+            let rco = data[val_offset];
             (CommandValue::Step(rco & 0x03), rco & 0x80 != 0, (rco >> 2) & 0x1F, FrameLabel::StepCommand)
         }
         AsduTypeId::CSeNa1 => {
-            let raw = i16::from_le_bytes([data[15], data[16]]);
-            let qos = data[17];
+            let raw = i16::from_le_bytes([data[val_offset], data[val_offset + 1]]);
+            let qos = data[val_offset + 2];
             (CommandValue::Normalized(raw), qos & 0x80 != 0, qos & 0x7F, FrameLabel::SetpointNormalized)
         }
         AsduTypeId::CSeNb1 => {
-            let raw = i16::from_le_bytes([data[15], data[16]]);
-            let qos = data[17];
+            let raw = i16::from_le_bytes([data[val_offset], data[val_offset + 1]]);
+            let qos = data[val_offset + 2];
             (CommandValue::Scaled(raw), qos & 0x80 != 0, qos & 0x7F, FrameLabel::SetpointScaled)
         }
         AsduTypeId::CSeNc1 => {
-            let raw = f32::from_le_bytes([data[15], data[16], data[17], data[18]]);
-            let qos = data[19];
+            let raw = f32::from_le_bytes([data[val_offset], data[val_offset + 1], data[val_offset + 2], data[val_offset + 3]]);
+            let qos = data[val_offset + 4];
             (CommandValue::Float(raw), qos & 0x80 != 0, qos & 0x7F, FrameLabel::SetpointFloat)
         }
         AsduTypeId::CBoNa1 => {
-            let raw = u32::from_le_bytes([data[15], data[16], data[17], data[18]]);
+            let raw = u32::from_le_bytes([data[val_offset], data[val_offset + 1], data[val_offset + 2], data[val_offset + 3]]);
             // C_BO_NA_1/C_BO_TA_1 无 S/E 位与限定词(IEC 60870-5-101 §7.3.2.8)。
             (CommandValue::Bitstring(raw), false, 0, FrameLabel::Bitstring)
         }
@@ -2337,14 +2408,18 @@ impl SlaveServer {
                                 if let Some(last) = conn.last_sent.get(&point.ioa) {
                                     if last == &value_str { continue; }
                                 }
+                                let cot_len = ops_snapshot.normalized_cot_len();
+                                let ca_len = ops_snapshot.normalized_ca_len();
+                                let ioa_len = ops_snapshot.normalized_ioa_len();
                                 let ca_bytes = station.common_address.to_le_bytes();
+                                let ca_slice = &ca_bytes[..ca_len];
                                 let asdu = {
                                     let mut s = conn.seq.lock().await;
-                                    let mut bytes = encode_point_frame_ex(point, 3, &ca_bytes, &mut *s, None);
+                                    let mut bytes = encode_point_frame_ex_with_lengths(point, 3, ca_slice, &mut *s, None, cot_len, ca_len, ioa_len);
                                     if ops_snapshot.sync_tb_by_category.enabled_for(point.asdu_type.category())
                                         && should_derive_tb(&station.data_points, point.asdu_type, point.ioa)
                                     {
-                                        bytes.extend(encode_point_frame_ex(point, 3, &ca_bytes, &mut *s, Some(true)));
+                                        bytes.extend(encode_point_frame_ex_with_lengths(point, 3, ca_slice, &mut *s, Some(true), cot_len, ca_len, ioa_len));
                                     }
                                     bytes
                                 };
@@ -2717,7 +2792,13 @@ async fn handle_client_read_loop(
                         format!("S frame N(R)={}", nr), data.to_vec(),
                     ));
                 }
-            } else if ctrl1 & 0x01 == 0 && data.len() >= 12 {
+            } else if ctrl1 & 0x01 == 0 {
+                let ops_snapshot = remote_ops.read().await.clone();
+                let cot_len = ops_snapshot.normalized_cot_len();
+                let ca_len = ops_snapshot.normalized_ca_len();
+                let ioa_len = ops_snapshot.normalized_ioa_len();
+                let min_i_len = 6 + 2 + cot_len + ca_len;
+                if data.len() >= min_i_len {
                 { let mut s = seq.lock().await; observe_recv_iframe(&mut s, &data); }
                 // w 窗口：累计未确认接收 I 帧数达到 w 时主动回 S 帧。
                 let w = protocol_timing.read().await.w;
@@ -2745,9 +2826,11 @@ async fn handle_client_read_loop(
                     // 取低 6 位作 cause 比较,使主站叠加 T/PN 位的去激活(COT=8|0x80)仍能命中停止激活分支,
                     // 而非误入激活路径(与 decode.rs cot=byte&0x3F 一致)。
                     let cause = data[8] & 0x3F;
-                let ca = u16::from_le_bytes([data[10], data[11]]);
-
-                let ops_snapshot = remote_ops.read().await.clone();
+                let ca_offset = 8 + cot_len;
+                let ca = match ca_len {
+                    1 => data[ca_offset] as u16,
+                    _ => u16::from_le_bytes([data[ca_offset], data[ca_offset + 1]]),
+                };
                 match asdu_type {
                     100 => {
                             // 去激活确认(COT=9)是管理层回复,须先于 answer_general_interrogation 抑制:
@@ -2829,6 +2912,7 @@ async fn handle_client_read_loop(
                                         recv_template, include_ts,
                                         queue_clone, seq_clone, k, lc_clone,
                                         FrameLabel::GeneralInterrogation, ca,
+                                        cot_len, ca_len, ioa_len,
                                     ).await;
                                 });
                                     interrogation_tasks.insert((ca, 20), handle);
@@ -2906,6 +2990,7 @@ async fn handle_client_read_loop(
                                         recv_template, include_ts,
                                         queue_clone, seq_clone, k, lc_clone,
                                         FrameLabel::CounterInterrogation, ca,
+                                        cot_len, ca_len, ioa_len,
                                     ).await;
                                 });
                                     interrogation_tasks.insert((ca, 37), handle);
@@ -2916,9 +3001,10 @@ async fn handle_client_read_loop(
                             // 合法 COT=6 且开关关闭时回否定 ACT_CON(7+P/N)；
                             // 非法 COT 回 45+P/N，IOA!=0 回 47+P/N。截断/畸形
                             // ASDU 无法安全回显，直接丢弃并记日志。
-                            let decision = decide_clock_sync(
+                            let decision = decide_clock_sync_with_lengths(
                                 &data[..n],
                                 ops_snapshot.answer_clock_sync,
+                                cot_len, ca_len, ioa_len,
                             );
                             if let Some(ack_cot) = decision.response_cot() {
                                 let ack = {
@@ -2932,7 +3018,7 @@ async fn handle_client_read_loop(
                             }
                     }
                     45..=51 | 58..=64 => {
-                        match parse_control_command(asdu_type, &data[..n]) {
+                        match parse_control_command_with_lengths(asdu_type, &data[..n], cot_len, ca_len, ioa_len) {
                             Some(cmd) => {
                                 let outcome = process_control_command(
                                     &data[..n], cause, ca, cmd,
@@ -2981,6 +3067,7 @@ async fn handle_client_read_loop(
                             })));
                         }
                     }
+                }
                 }
             }
         }
@@ -3100,16 +3187,24 @@ fn handle_client_blocking(
                     }
                     _ => {}
                 }
-            } else if ctrl1 & 0x01 == 0 && data.len() >= 12 {
+            } else if ctrl1 & 0x01 == 0 {
+                let ops_snapshot = rt.block_on(async { remote_ops.read().await.clone() });
+                let cot_len = ops_snapshot.normalized_cot_len();
+                let ca_len = ops_snapshot.normalized_ca_len();
+                let ioa_len = ops_snapshot.normalized_ioa_len();
+                let min_i_len = 6 + 2 + cot_len + ca_len;
+                if data.len() >= min_i_len {
                 rt.block_on(async { let mut s = seq.lock().await; observe_recv_iframe(&mut s, &data); });
                 let asdu_type = data[6];
                 // COT 字节布局:bit0..5=cause,bit6=negative-confirm,bit7=test(IEC 60870-5-101 §7.2.2.3)。
                 // 取低 6 位作 cause 比较,使主站叠加 T/PN 位的去激活(COT=8|0x80)仍能命中停止激活分支,
                 // 而非误入激活路径(与 decode.rs cot=byte&0x3F 一致)。
                 let cause = data[8] & 0x3F;
-                let ca = u16::from_le_bytes([data[10], data[11]]);
-
-                let ops_snapshot = rt.block_on(async { remote_ops.read().await.clone() });
+                let ca_offset = 8 + cot_len;
+                let ca = match ca_len {
+                    1 => data[ca_offset] as u16,
+                    _ => u16::from_le_bytes([data[ca_offset], data[ca_offset + 1]]),
+                };
                 match asdu_type {
                     100 => {
                         // 去激活确认先于 answer_general_interrogation 抑制:停止激活须确认,与数据上送开关无关。
@@ -3215,13 +3310,14 @@ fn handle_client_blocking(
                                     ));
                                 }
                                 let ca_bytes = station.common_address.to_le_bytes();
+                                let ca_slice = &ca_bytes[..ca_len];
                                 for point in station.data_points.all_sorted() {
                                     if !matches!(point.value, DataPointValue::IntegratedTotal { .. }) { continue; }
-                                    batch.extend_from_slice(&encode_point_frame_ex(point, 37, &ca_bytes, &mut s, Some(false)));
+                                    batch.extend_from_slice(&encode_point_frame_ex_with_lengths(point, 37, ca_slice, &mut s, Some(false), cot_len, ca_len, ioa_len));
                                     if ops_for_batch.gi_include_timestamped
                                         && should_derive_tb(&station.data_points, point.asdu_type, point.ioa)
                                     {
-                                        batch.extend_from_slice(&encode_point_frame_ex(point, 37, &ca_bytes, &mut s, Some(true)));
+                                        batch.extend_from_slice(&encode_point_frame_ex_with_lengths(point, 37, ca_slice, &mut s, Some(true), cot_len, ca_len, ioa_len));
                                     }
                                 }
                             }
@@ -3240,9 +3336,10 @@ fn handle_client_blocking(
                     }
                     103 => {
                         // 与明文路径共用同一结构/COT/IOA/开关决策。
-                        let decision = decide_clock_sync(
+                        let decision = decide_clock_sync_with_lengths(
                             &data[..n],
                             ops_snapshot.answer_clock_sync,
+                            cot_len, ca_len, ioa_len,
                         );
                         if let Some(ack_cot) = decision.response_cot() {
                             let ack = rt.block_on(async {
@@ -3256,7 +3353,7 @@ fn handle_client_blocking(
                         }
                     }
                     45..=51 | 58..=64 => {
-                        match parse_control_command(asdu_type, &data[..n]) {
+                        match parse_control_command_with_lengths(asdu_type, &data[..n], cot_len, ca_len, ioa_len) {
                             Some(cmd) => {
                                 let outcome = rt.block_on(process_control_command(
                                     &data[..n], cause, ca, cmd,
@@ -3302,6 +3399,7 @@ fn handle_client_blocking(
                         }
                     }
                 }
+                }
             }
         }
         } // end while complete TLS APDUs
@@ -3317,7 +3415,11 @@ async fn send_gi_response_blocking(
     ops: &RemoteOperationConfig,
 ) {
     use std::io::Write;
+    let cot_len = ops.normalized_cot_len();
+    let ca_len = ops.normalized_ca_len();
+    let ioa_len = ops.normalized_ioa_len();
     let ca_bytes = station.common_address.to_le_bytes();
+    let ca_slice = &ca_bytes[..ca_len];
     let mut batch: Vec<u8> = Vec::new();
     {
         let mut s = seq.lock().await;
@@ -3326,11 +3428,11 @@ async fn send_gi_response_blocking(
             // 控制方向点位不属于监视信息,同样排除。
             if matches!(point.value, DataPointValue::IntegratedTotal { .. }) { continue; }
             if point.asdu_type.category().is_control() { continue; }
-            batch.extend_from_slice(&encode_point_frame_ex(point, 20, &ca_bytes, &mut s, None));
+            batch.extend_from_slice(&encode_point_frame_ex_with_lengths(point, 20, ca_slice, &mut s, None, cot_len, ca_len, ioa_len));
             if ops.gi_include_timestamped
                 && should_derive_tb(&station.data_points, point.asdu_type, point.ioa)
             {
-                batch.extend_from_slice(&encode_point_frame_ex(point, 20, &ca_bytes, &mut s, Some(true)));
+                batch.extend_from_slice(&encode_point_frame_ex_with_lengths(point, 20, ca_slice, &mut s, Some(true), cot_len, ca_len, ioa_len));
             }
         }
     }
@@ -3345,7 +3447,18 @@ fn build_i_frame(
     asdu_type: u8, cause: u8, ca: &[u8], ioa: &[u8], value_bytes: &[u8],
     seq: &mut SeqState,
 ) -> Vec<u8> {
-    let asdu_len = 6 + ioa.len() + value_bytes.len();
+    build_i_frame_with_lengths(asdu_type, cause, ca, ioa, value_bytes, seq, 2, 2, 3)
+}
+
+fn build_i_frame_with_lengths(
+    asdu_type: u8, cause: u8, ca: &[u8], ioa: &[u8], value_bytes: &[u8],
+    seq: &mut SeqState,
+    cot_len: usize, ca_len: usize, ioa_len: usize,
+) -> Vec<u8> {
+    let cot_bytes = if cot_len == 1 { vec![cause] } else { vec![cause, 0x00] };
+    let ca_slice = if ca.len() < ca_len { ca } else { &ca[..ca_len] };
+    let ioa_slice = if ioa.len() < ioa_len { ioa } else { &ioa[..ioa_len] };
+    let asdu_len = 2 + cot_bytes.len() + ca_slice.len() + ioa_slice.len() + value_bytes.len();
     let total_len = 4 + asdu_len;
     let mut frame = Vec::with_capacity(2 + total_len);
     frame.push(0x68);
@@ -3360,9 +3473,11 @@ fn build_i_frame(
     seq.ssn = seq.ssn.wrapping_add(2);
     // N(R) is not auto-incremented per sent frame; it tracks the peer's N(S),
     // updated by observe_recv_iframe on receipt.
-    frame.extend_from_slice(&[asdu_type, 0x01, cause, 0x00]);
-    frame.extend_from_slice(&ca[..2]);
-    frame.extend_from_slice(ioa);
+    frame.push(asdu_type);
+    frame.push(0x01); // VSQ
+    frame.extend_from_slice(&cot_bytes);
+    frame.extend_from_slice(ca_slice);
+    frame.extend_from_slice(ioa_slice);
     frame.extend_from_slice(value_bytes);
     frame
 }
@@ -3435,6 +3550,14 @@ fn encode_point_frame_ex(
     point: &DataPoint, cot: u8, ca: &[u8],
     seq: &mut SeqState, force_timestamped: Option<bool>,
 ) -> Vec<u8> {
+    encode_point_frame_ex_with_lengths(point, cot, ca, seq, force_timestamped, 2, 2, 3)
+}
+
+fn encode_point_frame_ex_with_lengths(
+    point: &DataPoint, cot: u8, ca: &[u8],
+    seq: &mut SeqState, force_timestamped: Option<bool>,
+    cot_len: usize, ca_len: usize, ioa_len: usize,
+) -> Vec<u8> {
     // M_ME_ND_1 (TypeID 21): 归一化测量值,2 字节裸 NVA,无 QDS、无时标。
     // 它与 M_ME_NA_1 共用 `DataPointValue::Normalized`,只能靠 asdu_type 区分;
     // 前置拦截以免走 encode_na_value(那会按值返回 type 9 并附 QDS)。无 TB 变体,
@@ -3446,7 +3569,7 @@ fn encode_point_frame_ex(
         };
         let b = nva.to_le_bytes();
         let ioa_bytes = point.ioa.to_le_bytes();
-        return build_i_frame(21, cot, ca, &ioa_bytes[..3], &[b[0], b[1]], seq);
+        return build_i_frame_with_lengths(21, cot, ca, &ioa_bytes[..ioa_len], &[b[0], b[1]], seq, cot_len, ca_len, ioa_len);
     }
     let (na_type, mut value_bytes) = encode_na_value(&point.value, &point.quality);
     let ioa_bytes = point.ioa.to_le_bytes();
@@ -3457,7 +3580,7 @@ fn encode_point_frame_ex(
         let ts = point.timestamp.unwrap_or_else(chrono::Utc::now);
         let ts_bytes = crate::asdu_encode::encode_cp24time2a(ts, point.quality.iv);
         value_bytes.extend_from_slice(&ts_bytes);
-        return build_i_frame(point.asdu_type as u8, cot, ca, &ioa_bytes[..3], &value_bytes, seq);
+        return build_i_frame_with_lengths(point.asdu_type as u8, cot, ca, &ioa_bytes[..ioa_len], &value_bytes, seq, cot_len, ca_len, ioa_len);
     }
     let want_tb = match force_timestamped {
         Some(b) => b,
@@ -3469,10 +3592,10 @@ fn encode_point_frame_ex(
             let ts = point.timestamp.unwrap_or_else(chrono::Utc::now);
             let ts_bytes = crate::asdu_encode::encode_cp56time2a(ts, point.quality.iv);
             value_bytes.extend_from_slice(&ts_bytes);
-            return build_i_frame(tb as u8, cot, ca, &ioa_bytes[..3], &value_bytes, seq);
+            return build_i_frame_with_lengths(tb as u8, cot, ca, &ioa_bytes[..ioa_len], &value_bytes, seq, cot_len, ca_len, ioa_len);
         }
     }
-    build_i_frame(na_type, cot, ca, &ioa_bytes[..3], &value_bytes, seq)
+    build_i_frame_with_lengths(na_type, cot, ca, &ioa_bytes[..ioa_len], &value_bytes, seq, cot_len, ca_len, ioa_len)
 }
 
 /// Encode imported schedule snapshots as SQ=0 ASDUs. Every information object
@@ -3484,6 +3607,18 @@ fn encode_points_discrete(
     ca: &[u8; 2],
     seq: &mut SeqState,
 ) -> Vec<Vec<u8>> {
+    encode_points_discrete_with_lengths(points, cot, &ca[..], seq, 2, 2, 3)
+}
+
+fn encode_points_discrete_with_lengths(
+    points: &[DataPoint],
+    cot: u8,
+    ca: &[u8],
+    seq: &mut SeqState,
+    cot_len: usize,
+    ca_len: usize,
+    ioa_len: usize,
+) -> Vec<Vec<u8>> {
     if points.is_empty() {
         return Vec::new();
     }
@@ -3494,7 +3629,7 @@ fn encode_points_discrete(
         .iter()
         .map(|point| {
             let mut bytes = Vec::new();
-            bytes.extend_from_slice(&point.ioa.to_le_bytes()[..3]);
+            bytes.extend_from_slice(&point.ioa.to_le_bytes()[..ioa_len]);
             if asdu_type == AsduTypeId::MMeNd1 {
                 let nva = match point.value {
                     DataPointValue::Normalized { value } => {
@@ -3526,6 +3661,7 @@ fn encode_points_discrete(
 
     let mut frames = Vec::new();
     let mut start = 0usize;
+    let header_len = 2 + cot_len + ca_len;
     while start < objects.len() {
         // IEC APDU length counts the four control bytes and the ASDU. The
         // one-byte length field caps that part at 253 bytes.
@@ -3533,14 +3669,14 @@ fn encode_points_discrete(
         let mut end = start;
         while end < objects.len()
             && end - start < 0x7f
-            && 4 + 6 + payload_len + objects[end].len() <= 253
+            && 4 + header_len + payload_len + objects[end].len() <= 253
         {
             payload_len += objects[end].len();
             end += 1;
         }
         debug_assert!(end > start, "one scheduled information object must fit in an APDU");
 
-        let total_len = 4 + 6 + payload_len;
+        let total_len = 4 + header_len + payload_len;
         let mut frame = Vec::with_capacity(2 + total_len);
         frame.push(0x68);
         frame.push(total_len as u8);
@@ -3551,9 +3687,14 @@ fn encode_points_discrete(
         seq.ssn = seq.ssn.wrapping_add(2);
         frame.push(asdu_type as u8);
         frame.push((end - start) as u8); // VSQ.SQ=0
-        frame.push(cot);
-        frame.push(0x00); // ORG=0 for slave-originated data
-        frame.extend_from_slice(ca);
+        if cot_len == 1 {
+            frame.push(cot);
+        } else {
+            frame.push(cot);
+            frame.push(0x00); // ORG=0 for slave-originated data
+        }
+        let ca_slice = if ca.len() < ca_len { ca } else { &ca[..ca_len] };
+        frame.extend_from_slice(ca_slice);
         for object in &objects[start..end] {
             frame.extend_from_slice(object);
         }
@@ -3568,6 +3709,14 @@ fn encode_points_discrete(
 fn encode_points_grouped(
     points: &[&DataPoint], cot: u8, ca: &[u8],
     seq: &mut SeqState, timestamped: bool,
+) -> Option<Vec<u8>> {
+    encode_points_grouped_with_lengths(points, cot, ca, seq, timestamped, 2, 2, 3)
+}
+
+fn encode_points_grouped_with_lengths(
+    points: &[&DataPoint], cot: u8, ca: &[u8],
+    seq: &mut SeqState, timestamped: bool,
+    cot_len: usize, ca_len: usize, ioa_len: usize,
 ) -> Option<Vec<u8>> {
     if points.is_empty() { return None; }
     // M_ME_ND_1 无法用 encode_na_value 表达(它会按 Normalized 值返回 type 9 + QDS),
@@ -3611,7 +3760,7 @@ fn encode_points_grouped(
         }
     }
     let ioa_bytes = points[0].ioa.to_le_bytes();
-    let asdu_len = 6 + 3 + value_section.len();
+    let asdu_len = 2 + cot_len + ca_len + ioa_len + value_section.len();
     let total_len = 4 + asdu_len;
     if total_len > 253 { return None; }
     let mut frame = Vec::with_capacity(2 + total_len);
@@ -3624,10 +3773,15 @@ fn encode_points_grouped(
     seq.ssn = seq.ssn.wrapping_add(2);
     frame.push(final_type);
     frame.push(0x80 | (n & 0x7F)); // VSQ.SQ=1
-    frame.push(cot);
-    frame.push(0x00);
-    frame.extend_from_slice(&ca[..2]);
-    frame.extend_from_slice(&ioa_bytes[..3]);
+    if cot_len == 1 {
+        frame.push(cot);
+    } else {
+        frame.push(cot);
+        frame.push(0x00);
+    }
+    let ca_slice = if ca.len() < ca_len { ca } else { &ca[..ca_len] };
+    frame.extend_from_slice(ca_slice);
+    frame.extend_from_slice(&ioa_bytes[..ioa_len]);
     frame.extend_from_slice(&value_section);
     Some(frame)
 }
@@ -3651,8 +3805,9 @@ async fn wait_window(seq: &SharedSeq, k: u16) {
 /// 每帧前做 k 窗口阻塞；失败（含 total_len 超限）回退到逐点 `encode_point_frame_ex`。
 /// `seg` 必须已经满足类型相同 + IOA 连续，否则会回退到逐点路径。
 async fn encode_segment_and_enqueue(
-    seg: &[DataPoint], cot: u8, ca: &[u8; 2],
+    seg: &[DataPoint], cot: u8, ca: &[u8],
     seq: &SharedSeq, queue: &SharedQueue, k: u16, timestamped: bool,
+    cot_len: usize, ca_len: usize, ioa_len: usize,
 ) -> usize {
     let mut i = 0;
     let mut frames_emitted = 0usize;
@@ -3664,7 +3819,7 @@ async fn encode_segment_and_enqueue(
             wait_window(seq, k).await;
             let frame_opt = {
                 let mut s = seq.lock().await;
-                encode_points_grouped(&refs, cot, &ca[..], &mut *s, timestamped)
+                encode_points_grouped_with_lengths(&refs, cot, ca, &mut *s, timestamped, cot_len, ca_len, ioa_len)
             };
             if let Some(frame) = frame_opt {
                 queue.lock().await.extend_from_slice(&frame);
@@ -3680,9 +3835,10 @@ async fn encode_segment_and_enqueue(
             wait_window(seq, k).await;
             let frame = {
                 let mut s = seq.lock().await;
-                encode_point_frame_ex(
-                    &seg[i], cot, &ca[..], &mut *s,
+                encode_point_frame_ex_with_lengths(
+                    &seg[i], cot, ca, &mut *s,
                     if timestamped { Some(true) } else { Some(false) },
+                    cot_len, ca_len, ioa_len,
                 )
             };
             queue.lock().await.extend_from_slice(&frame);
@@ -3713,6 +3869,9 @@ async fn run_interrogation(
     log_collector: Option<Arc<LogCollector>>,
     label: FrameLabel,
     ca_label: u16,
+    cot_len: usize,
+    ca_len: usize,
+    ioa_len: usize,
 ) {
     // 按 (asdu_type 数值, ioa) 排序。同类型连续段可被 encode_points_grouped 合并为
     // 一个 VSQ.SQ=1 ASDU；不同 type 之间的边界天然断开。
@@ -3723,6 +3882,7 @@ async fn run_interrogation(
         .filter(|p| p.asdu_type.is_timestamped())
         .map(|p| (p.ioa, p.asdu_type))
         .collect();
+    let ca_slice = &ca_bytes[..ca_len];
     let mut i = 0;
     while i < points.len() {
         let kind0 = points[i].asdu_type;
@@ -3735,7 +3895,8 @@ async fn run_interrogation(
         let seg = &points[i..j];
         let kind_is_timestamped = kind0.is_timestamped();
         encode_segment_and_enqueue(
-            seg, cot_data, &ca_bytes, &seq, &queue, k, kind_is_timestamped,
+            seg, cot_data, ca_slice, &seq, &queue, k, kind_is_timestamped,
+            cot_len, ca_len, ioa_len,
         ).await;
         // include_timestamped 时为不带时标段派生 TB 帧;R1 让已有显式 TB 的 IOA 不再派生。
         if let Some(tb_type) = kind0
@@ -3746,12 +3907,16 @@ async fn run_interrogation(
                 && seg.iter().any(|p| explicit_tb.contains(&(p.ioa, tb_type)));
             if !any_suppressed {
                 // 本段无 IOA 被压制,整段派生以保持 SQ=1 分组。
-                encode_segment_and_enqueue(seg, cot_data, &ca_bytes, &seq, &queue, k, true).await;
+                encode_segment_and_enqueue(
+                    seg, cot_data, ca_slice, &seq, &queue, k, true,
+                    cot_len, ca_len, ioa_len,
+                ).await;
             } else {
                 for p in seg {
                     if explicit_tb.contains(&(p.ioa, tb_type)) { continue; }
                     encode_segment_and_enqueue(
-                        std::slice::from_ref(p), cot_data, &ca_bytes, &seq, &queue, k, true,
+                        std::slice::from_ref(p), cot_data, ca_slice, &seq, &queue, k, true,
+                        cot_len, ca_len, ioa_len,
                     ).await;
                 }
             }
@@ -4213,7 +4378,11 @@ async fn do_queue_spontaneous(
         Some(s) => s,
         None => return,
     };
+    let cot_len = ops.normalized_cot_len();
+    let ca_len = ops.normalized_ca_len();
+    let ioa_len = ops.normalized_ioa_len();
     let ca_bytes = station.common_address.to_le_bytes();
+    let ca_slice = &ca_bytes[..ca_len];
     let mut conns = connections.write().await;
     let mut total_sent = 0usize;
     for (_addr, conn) in conns.iter_mut() {
@@ -4243,7 +4412,7 @@ async fn do_queue_spontaneous(
                     let want_na_mode = ops.upload_mode_untimestamped == UploadMode::Continuous
                         && !segment[0].asdu_type.is_timestamped();
                     if want_tb_mode || want_na_mode {
-                        if let Some(frame) = encode_points_grouped(segment, 3, &ca_bytes, &mut *s, segment[0].asdu_type.is_timestamped()) {
+                        if let Some(frame) = encode_points_grouped_with_lengths(segment, 3, ca_slice, &mut *s, segment[0].asdu_type.is_timestamped(), cot_len, ca_len, ioa_len) {
                             batch.extend(frame);
                             for p in segment { conn.last_sent.insert(p.ioa, p.value.display()); }
                             start = end;
@@ -4251,11 +4420,11 @@ async fn do_queue_spontaneous(
                         }
                     }
                     for p in segment {
-                        batch.extend(encode_point_frame_ex(p, 3, &ca_bytes, &mut *s, None));
+                        batch.extend(encode_point_frame_ex_with_lengths(p, 3, ca_slice, &mut *s, None, cot_len, ca_len, ioa_len));
                         if ops.sync_tb_by_category.enabled_for(p.asdu_type.category())
                             && should_derive_tb(&station.data_points, p.asdu_type, p.ioa)
                         {
-                            batch.extend(encode_point_frame_ex(p, 3, &ca_bytes, &mut *s, Some(true)));
+                            batch.extend(encode_point_frame_ex_with_lengths(p, 3, ca_slice, &mut *s, Some(true), cot_len, ca_len, ioa_len));
                         }
                         conn.last_sent.insert(p.ioa, p.value.display());
                     }
@@ -4268,11 +4437,11 @@ async fn do_queue_spontaneous(
                         None => continue,
                     };
                     if point.asdu_type.category().is_control() { continue; }
-                    batch.extend(encode_point_frame_ex(point, 3, &ca_bytes, &mut *s, None));
+                    batch.extend(encode_point_frame_ex_with_lengths(point, 3, ca_slice, &mut *s, None, cot_len, ca_len, ioa_len));
                     if ops.sync_tb_by_category.enabled_for(asdu_type.category())
                         && should_derive_tb(&station.data_points, asdu_type, ioa)
                     {
-                        batch.extend(encode_point_frame_ex(point, 3, &ca_bytes, &mut *s, Some(true)));
+                        batch.extend(encode_point_frame_ex_with_lengths(point, 3, ca_slice, &mut *s, Some(true), cot_len, ca_len, ioa_len));
                     }
                     conn.last_sent.insert(ioa, point.value.display());
                 }
@@ -6411,5 +6580,112 @@ mod tests {
             assert!(station.data_points.get(100 + i, AsduTypeId::MSpNa1).is_some());
             assert!(station.data_points.get(100 + i, AsduTypeId::MMeNc1).is_some());
         }
+    }
+
+    #[test]
+    fn remote_operation_config_data_lengths_defaults_and_serde_backwards_compatible() {
+        let default_ops = RemoteOperationConfig::default();
+        assert_eq!(default_ops.cot_len, 2);
+        assert_eq!(default_ops.ca_len, 2);
+        assert_eq!(default_ops.ioa_len, 3);
+        assert_eq!(default_ops.normalized_cot_len(), 2);
+        assert_eq!(default_ops.normalized_ca_len(), 2);
+        assert_eq!(default_ops.normalized_ioa_len(), 3);
+
+        // Test serde backwards compatibility with legacy JSON missing the 3 fields
+        let legacy_json = r#"{
+            "answer_general_interrogation": true,
+            "answer_commands": true
+        }"#;
+        let parsed: RemoteOperationConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.cot_len, 2);
+        assert_eq!(parsed.ca_len, 2);
+        assert_eq!(parsed.ioa_len, 3);
+        assert_eq!(parsed.normalized_cot_len(), 2);
+        assert_eq!(parsed.normalized_ca_len(), 2);
+        assert_eq!(parsed.normalized_ioa_len(), 3);
+
+        // Test with custom lengths
+        let custom_json = r#"{
+            "cot_len": 1,
+            "ca_len": 1,
+            "ioa_len": 2
+        }"#;
+        let custom: RemoteOperationConfig = serde_json::from_str(custom_json).unwrap();
+        assert_eq!(custom.cot_len, 1);
+        assert_eq!(custom.ca_len, 1);
+        assert_eq!(custom.ioa_len, 2);
+        assert_eq!(custom.normalized_cot_len(), 1);
+        assert_eq!(custom.normalized_ca_len(), 1);
+        assert_eq!(custom.normalized_ioa_len(), 2);
+
+        // Test normalizer out of bounds fallback
+        let oob = RemoteOperationConfig {
+            cot_len: 0,
+            ca_len: 5,
+            ioa_len: 99,
+            ..Default::default()
+        };
+        assert_eq!(oob.normalized_cot_len(), 2);
+        assert_eq!(oob.normalized_ca_len(), 2);
+        assert_eq!(oob.normalized_ioa_len(), 3);
+    }
+
+    #[test]
+    fn custom_lengths_encode_and_decode_roundtrip() {
+        let mut seq = SeqState { ssn: 0, rsn: 0, ack_ssn: 0, unacked_recv: 0, last_s_ack_at: tokio::time::Instant::now() };
+        let mut point = DataPoint::new(105, AsduTypeId::MSpNa1);
+        point.value = DataPointValue::SinglePoint { value: true };
+        let ca_bytes = [3u8, 0u8];
+
+        // 1-byte COT, 1-byte CA, 2-byte IOA
+        let frame = encode_point_frame_ex_with_lengths(&point, 3, &ca_bytes[..1], &mut seq, None, 1, 1, 2);
+        // APCI: 6 bytes.
+        // ASDU Header: Type (1) + VSQ (1) + COT (1) + CA (1) = 4 bytes.
+        // IOA: 2 bytes.
+        // Value: 1 byte (SIQ).
+        // Total frame len = 6 + 4 + 2 + 1 = 13 bytes.
+        assert_eq!(frame.len(), 13);
+        assert_eq!(frame[0], 0x68);
+        assert_eq!(frame[1], 11); // total_len = 4 + asdu_len(7) = 11
+        assert_eq!(frame[6], 1); // TypeID 1 (M_SP_NA_1)
+        assert_eq!(frame[7], 1); // VSQ
+        assert_eq!(frame[8], 3); // COT=3 (1 byte)
+        assert_eq!(frame[9], 3); // CA=3 (1 byte)
+        assert_eq!(frame[10], 105); // IOA low byte
+        assert_eq!(frame[11], 0); // IOA high byte
+        assert_eq!(frame[12] & 0x01, 1); // SIQ value=true
+
+        // Roundtrip with decode_with_lengths
+        let parsed = crate::decode::parse_frame_full_with_lengths(&frame, 1, 1, 2).unwrap();
+        let asdu = parsed.asdu.unwrap();
+        assert_eq!(asdu.type_id, 1);
+        assert_eq!(asdu.cot, 3);
+        assert_eq!(asdu.cot_name, "突发");
+        assert_eq!(asdu.common_address, 3);
+        assert_eq!(asdu.objects.len(), 1);
+        assert_eq!(asdu.objects[0].ioa, 105);
+    }
+
+    #[test]
+    fn custom_lengths_parse_control_command() {
+        // Build a C_SC_NA_1 (Type 45) command with cot_len=1, ca_len=1, ioa_len=2
+        // APCI: 6 bytes [0x68, len, 0, 0, 0, 0]
+        // ASDU header: type=45, vsq=1, cot=6 (1 byte), ca=5 (1 byte)
+        // IOA: 200 (2 bytes: 200, 0)
+        // SCO: 0x81 (Select + ON)
+        let frame = vec![
+            0x68, 10, 0x00, 0x00, 0x00, 0x00, // APCI (len=10)
+            45, 0x01, // Type, VSQ
+            0x06, // COT=6 (1 byte)
+            0x05, // CA=5 (1 byte)
+            200, 0x00, // IOA=200 (2 bytes)
+            0x81, // SCO (select=true, on=true, qu=0)
+        ];
+        let parsed = parse_control_command_with_lengths(45, &frame, 1, 1, 2).expect("should parse");
+        assert_eq!(parsed.ioa, 200);
+        assert!(parsed.is_select);
+        assert_eq!(parsed.value, CommandValue::Single(true));
+        assert_eq!(parsed.qu, 0);
     }
 }

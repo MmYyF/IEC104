@@ -65,6 +65,41 @@ const timingMeta: { key: 't0' | 't1' | 't2' | 't3' | 'k' | 'w'; hintKey: string;
 </script>
 
 <template>
+  <!-- 数据长度 -->
+  <section class="rp-sec">
+    <header class="rp-sec-head">
+      <h4>{{ t('remoteParams.dataLengths') }}</h4>
+      <span class="rp-sec-sub">{{ t('remoteParams.dataLengthsSub') }}</span>
+    </header>
+    <div class="rp-rows">
+      <label class="rp-row rp-row-len">
+        <span class="rp-row-key">{{ t('remoteParams.cotLen') }}</span>
+        <select v-model.number="ops.cot_len">
+          <option :value="1">1 字节 (1 Byte)</option>
+          <option :value="2">2 字节 (2 Bytes - 默认)</option>
+        </select>
+        <span class="rp-row-hint">{{ t('remoteParams.cotLenHint') }}</span>
+      </label>
+      <label class="rp-row rp-row-len">
+        <span class="rp-row-key">{{ t('remoteParams.caLen') }}</span>
+        <select v-model.number="ops.ca_len">
+          <option :value="1">1 字节 (1 Byte)</option>
+          <option :value="2">2 字节 (2 Bytes - 默认)</option>
+        </select>
+        <span class="rp-row-hint">{{ t('remoteParams.caLenHint') }}</span>
+      </label>
+      <label class="rp-row rp-row-len">
+        <span class="rp-row-key">{{ t('remoteParams.ioaLen') }}</span>
+        <select v-model.number="ops.ioa_len">
+          <option :value="1">1 字节 (1 Byte)</option>
+          <option :value="2">2 字节 (2 Bytes)</option>
+          <option :value="3">3 字节 (3 Bytes - 默认)</option>
+        </select>
+        <span class="rp-row-hint">{{ t('remoteParams.ioaLenHint') }}</span>
+      </label>
+    </div>
+  </section>
+
   <!-- 链路参数 -->
   <section class="rp-sec">
     <header class="rp-sec-head">
@@ -526,5 +561,41 @@ const timingMeta: { key: 't0' | 't1' | 't2' | 't3' | 'k' | 'w'; hintKey: string;
 .rp-pacing {
   display: grid;
   gap: 6px;
+}
+
+/* —— 数据长度 —— */
+.rp-row-len {
+  display: grid;
+  grid-template-columns: 160px 170px 1fr;
+  align-items: center;
+  gap: 0 10px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.rp-row-len + .rp-row-len {
+  border-top: 1px solid color-mix(in srgb, var(--c-surface0) 50%, transparent);
+}
+
+.rp-row-len select {
+  width: 100%;
+  height: 24px;
+  padding: 0 6px;
+  background: var(--c-base);
+  border: 1px solid var(--c-surface0);
+  border-radius: 4px;
+  color: var(--c-text);
+  font: 500 12px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  transition: border-color 80ms linear, background 80ms linear;
+}
+
+.rp-row-len select:hover {
+  border-color: var(--c-surface1);
+}
+
+.rp-row-len select:focus {
+  outline: none;
+  border-color: var(--c-blue);
+  background: color-mix(in srgb, var(--c-blue) 6%, var(--c-base));
 }
 </style>
